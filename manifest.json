@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.qadram.nvme-health",
-  "name": "NVMe Health",
-  "version": "1.0.0",
-  "author": "qadram",
+  "id": "io.github.TowhidMolla-Dev.disk-health",
+  "name": "Disk Health",
+  "version": "1.1.0",
+  "author": "TowhidMolla-Dev",
   "license": "MIT",
-  "description": "Disk SMART health in the Omarchy bar via UDisks2: power-on hours, reallocated sectors, TBW, and remaining life.",
+  "description": "SSD and HDD SMART health in the Omarchy bar via UDisks2: power-on hours, reallocated and pending sectors, CRC errors, TBW, and remaining life.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "NVMe Health",
-    "description": "SMART health summary with remaining life estimate.",
+    "displayName": "Disk Health",
+    "description": "SMART health summary for every SSD and HDD in the system.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -36,7 +36,7 @@
         "label": "Device path",
         "defaultValue": "",
         "maxLength": 64,
-        "description": "Empty selects the first NVMe (then first ATA drive) from UDisks2."
+        "description": "Empty monitors every SSD and HDD reported by UDisks2."
       }
     ]
   }

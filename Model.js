@@ -38,13 +38,73 @@ function formatPercent(value) {
   return Math.round(Number(value)) + "%"
 }
 
+function healthyPercent(disk) {
+  if (!disk) return null
+  var life = disk.lifeRemainingPercent
+  if (life !== null && life !== undefined && isFinite(Number(life))) return Math.round(Number(life))
+  var health = disk.healthPercent
+  if (health !== null && health !== undefined && isFinite(Number(health))) return Math.round(Number(health))
+  return null
+}
+
+function worstDisk(disks) {
+  if (!disks || !disks.length) return null
+  var worst = null
+  var worstRank = null
+  for (var i = 0; i < disks.length; i++) {
+    var d = disks[i]
+    if (!d) continue
+    var rank = [d.warning === true ? 0 : 1, d.passed === false ? 0 : 1, healthyPercent(d)]
+    if (rank[2] === null) rank[2] = 101
+    if (worstRank === null) {
+      worst = d
+      worstRank = rank
+      continue
+    }
+    for (var k = 0; k < 3; k++) {
+      if (rank[k] === worstRank[k]) continue
+      if (rank[k] < worstRank[k]) {
+        worst = d
+        worstRank = rank
+      }
+      break
+    }
+  }
+  return worst
+}
+
+function diskList(status) {
+  if (!status || typeof status !== "object") return []
+  var list = status.disks
+  if (Array.isArray(list) && list.length) return list
+  return status.disk ? [status.disk] : []
+}
+
 function barLabel(disk, _needsSetup, unavailable) {
   if (unavailable && !disk) return "?"
   if (!disk) return "—"
   if (disk.warning) return "!"
-  if (disk.lifeRemainingPercent === null || disk.lifeRemainingPercent === undefined)
-    return "OK"
-  return Math.round(Number(disk.lifeRemainingPercent)) + "%"
+  var pct = healthyPercent(disk)
+  return pct === null ? "OK" : pct + "%"
+}
+
+function barLabelForStatus(status) {
+  return barLabel(worstDisk(diskList(status)), false, !status || status.ok === false)
+}
+
+function formatTemp(value) {
+  if (value === null || value === undefined || !isFinite(Number(value))) return "—"
+  return Math.round(Number(value)) + " °C"
+}
+
+function formatCount(value) {
+  if (value === null || value === undefined || !isFinite(Number(value))) return "—"
+  return Number(value).toLocaleString("en-US")
+}
+
+function isSsd(disk) {
+  if (!disk) return true
+  return disk.protocol === "nvme"
 }
 
 function parseStatus(text) {
@@ -64,7 +124,14 @@ if (typeof module !== "undefined") {
     formatHours: formatHours,
     formatTiB: formatTiB,
     formatPercent: formatPercent,
+    formatTemp: formatTemp,
+    formatCount: formatCount,
+    isSsd: isSsd,
+    healthyPercent: healthyPercent,
+    worstDisk: worstDisk,
+    diskList: diskList,
     barLabel: barLabel,
+    barLabelForStatus: barLabelForStatus,
     parseStatus: parseStatus,
     MAX_STATUS_CHARS: MAX_STATUS_CHARS
   }

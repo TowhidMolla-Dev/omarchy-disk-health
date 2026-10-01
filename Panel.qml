@@ -7,7 +7,7 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "io.github.qadram.nvme-health"
+  moduleName: "io.github.TowhidMolla-Dev.disk-health"
   manageIpc: false
 
   property var anchorItem: null
@@ -17,9 +17,17 @@ Panel {
   property bool loading: false
   property string lastError: ""
 
-  readonly property var disk: status && status.disk ? status.disk : null
-  readonly property bool warning: disk ? disk.warning === true : (status ? status.ok === false : false)
-  readonly property string label: Model.barLabel(disk, false, status && status.ok === false)
+  readonly property var disk: Model.worstDisk(Model.diskList(status))
+  readonly property var disks: Model.diskList(status)
+  readonly property bool warning: {
+    if (disks.length) {
+      for (var i = 0; i < disks.length; i++)
+        if (disks[i] && disks[i].warning === true) return true
+      return false
+    }
+    return status ? status.ok === false : false
+  }
+  readonly property string label: Model.barLabelForStatus(status)
 
   readonly property int refreshIntervalSec: {
     var n = Number(setting("refreshIntervalSec", 300))
@@ -80,19 +88,54 @@ Panel {
       lastError = String(parsed.message).substring(0, 256)
   }
 
-  function metricValue(key) {
-    if (!disk) return "—"
-    if (key === "hours") return Model.formatHours(disk.powerOnHours)
-    if (key === "realloc") {
-      if (disk.protocol === "nvme")
-        return disk.mediaErrors === null || disk.mediaErrors === undefined ? "—" : String(disk.mediaErrors)
-      return disk.reallocatedSectors === null || disk.reallocatedSectors === undefined ? "—" : String(disk.reallocatedSectors)
+  function metricValue(target, key) {
+    if (!target) return "—"
+    if (key === "health") {
+      var pct = Model.healthyPercent(target)
+      return pct === null ? "—" : pct + "%"
     }
-    if (key === "tbw") return Model.formatTiB(disk.tbwTiB)
-    if (key === "life") return Model.formatPercent(disk.lifeRemainingPercent)
-    if (key === "spare") return Model.formatPercent(disk.availableSparePercent)
-    if (key === "used") return Model.formatPercent(disk.percentageUsed)
+    if (key === "hours") return Model.formatHours(target.powerOnHours)
+    if (key === "temp") return Model.formatTemp(target.temperatureC)
+    if (key === "cycles") return Model.formatCount(target.powerCycles)
+    if (key === "tbw") return Model.formatTiB(target.tbwTiB)
+    if (key === "life") return Model.formatPercent(target.lifeRemainingPercent)
+    if (key === "spare") return Model.formatPercent(target.availableSparePercent)
+    if (key === "used") return Model.formatPercent(target.percentageUsed)
+    // Media and data integrity errors for SSDs; sector reallocation for HDDs.
+    if (key === "errors")
+      return Model.formatCount(target.protocol === "nvme" ? target.mediaErrors : target.reallocatedSectors)
+    if (key === "pending") return Model.formatCount(target.pendingSectors)
+    if (key === "uncorrectable") return Model.formatCount(target.offlineUncorrectable)
+    if (key === "crc") return Model.formatCount(target.udmaCrcErrors)
+    if (key === "badblocks") return Model.formatCount(target.badBlocks)
     return "—"
+  }
+
+  // Metric rows per drive type, so an HDD never shows NVMe-only columns.
+  function metricsFor(target) {
+    if (!target) return []
+    if (target.protocol === "nvme") {
+      return [
+        { label: "Health", key: "health" },
+        { label: "Power-on", key: "hours" },
+        { label: "Media errors", key: "errors" },
+        { label: "Data written", key: "tbw" },
+        { label: "Spare", key: "spare" },
+        { label: "Wear used", key: "used" },
+        { label: "Power cycles", key: "cycles" }
+      ]
+    }
+    return [
+      { label: "Health", key: "health" },
+      { label: "Power-on", key: "hours" },
+      { label: "Temperature", key: "temp" },
+      { label: "Reallocated", key: "errors" },
+      { label: "Pending", key: "pending" },
+      { label: "Uncorrectable", key: "uncorrectable" },
+      { label: "CRC errors", key: "crc" },
+      { label: "Bad blocks", key: "badblocks" },
+      { label: "Power cycles", key: "cycles" }
+    ]
   }
 
   Timer {
@@ -180,25 +223,18 @@ Panel {
       Column {
         id: content
         width: parent.width
-        spacing: Style.space(10)
+        spacing: Style.space(12)
 
         Text {
           width: parent.width
-          text: disk && disk.model ? disk.model : "Disk SMART"
+          text: root.disks.length > 1
+            ? root.disks.length + " drives"
+            : (root.disk && root.disk.model ? root.disk.model : "Disk SMART")
           color: root.contentForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.subtitle
           font.bold: true
           wrapMode: Text.WordWrap
-        }
-
-        Text {
-          width: parent.width
-          visible: disk && disk.device
-          text: disk ? String(disk.device) : ""
-          color: root.contentDim
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.caption
         }
 
         Text {
@@ -215,63 +251,94 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        Text {
-          width: parent.width
-          visible: !!disk
-          text: {
-            if (!disk) return ""
-            if (disk.passed === true) return "SMART: PASSED"
-            if (disk.passed === false) return "SMART: FAILED"
-            return root.loading ? "Refreshing…" : "SMART status"
-          }
-          color: disk && disk.passed === false
-            ? (root.bar ? root.bar.urgent : Color.urgent)
-            : root.contentForeground
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
+        Repeater {
+          model: root.disks
 
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-          visible: !!disk
+          delegate: Column {
+            id: driveRow
+            required property var modelData
+            required property int index
 
-          Repeater {
-            model: [
-              { label: "Life remaining", key: "life" },
-              { label: "Power-on", key: "hours" },
-              { label: disk && disk.protocol === "nvme" ? "Media errors" : "Reallocated sectors", key: "realloc" },
-              { label: "TBW", key: "tbw" },
-              { label: "Spare", key: "spare" },
-              { label: "Wear used", key: "used" }
-            ]
+            readonly property var drive: modelData
+
+            width: content.width
+            spacing: Style.space(4)
+
+            Rectangle {
+              width: parent.width
+              height: 1
+              color: root.contentDim
+              opacity: 0.25
+              visible: driveRow.index > 0
+            }
 
             Row {
-              required property var modelData
-              width: content.width
-              spacing: Style.space(12)
-              visible: {
-                if (!disk) return false
-                if (modelData.key === "spare" || modelData.key === "used")
-                  return disk.protocol === "nvme"
-                return true
-              }
+              width: parent.width
+              spacing: Style.space(8)
 
               Text {
-                width: Style.space(150)
-                text: modelData.label
-                color: root.contentDim
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-
-              Text {
-                text: root.metricValue(modelData.key)
+                width: Style.space(140)
+                text: driveRow.drive && driveRow.drive.model
+                  ? String(driveRow.drive.model)
+                  : "Unknown drive"
                 color: root.contentForeground
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.body
                 font.bold: true
+                elide: Text.ElideRight
+              }
+
+              Text {
+                text: Model.isSsd(driveRow.drive) ? "SSD" : "HDD"
+                color: root.contentDim
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+
+            Text {
+              id: smartStatusLine
+              width: parent.width
+              readonly property string verdict: {
+                if (!driveRow.drive) return ""
+                if (driveRow.drive.passed === true) return "SMART PASSED"
+                if (driveRow.drive.passed === false) return "SMART FAILED"
+                return "SMART status unknown"
+              }
+              text: (driveRow.drive && driveRow.drive.device ? String(driveRow.drive.device) : "")
+                + "  ·  " + smartStatusLine.verdict
+                + (driveRow.drive && driveRow.drive.warning === true ? "  ·  needs attention" : "")
+              color: driveRow.drive && (driveRow.drive.passed === false || driveRow.drive.warning === true)
+                ? (root.bar ? root.bar.urgent : Color.urgent)
+                : root.contentDim
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Repeater {
+              model: root.metricsFor(driveRow.drive)
+
+              Row {
+                required property var modelData
+                width: driveRow.width
+                spacing: Style.space(12)
+
+                Text {
+                  width: Style.space(140)
+                  text: modelData.label
+                  color: root.contentDim
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Text {
+                  text: root.metricValue(driveRow.drive, modelData.key)
+                  color: root.contentForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
               }
             }
           }

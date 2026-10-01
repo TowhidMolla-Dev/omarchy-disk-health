@@ -5,7 +5,7 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "io.github.qadram.nvme-health"
+  moduleName: "io.github.TowhidMolla-Dev.disk-health"
 
   readonly property bool opened: panelLoader.item
     ? panelLoader.item.opened === true
