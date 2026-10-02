@@ -320,16 +320,24 @@ def slim_nvme_attrs(attrs: Any) -> dict[str, Any]:
   return out
 
 
-def nvme_temp_c(nvme_props: dict[str, Any], attrs: dict[str, Any]) -> int | None:
-  """NVMe temperature in Celsius, or None when it cannot be trusted.
+def kelvin_to_celsius(value: Any) -> int | None:
+  """Convert a UDisks2 SmartTemperature reading to Celsius, or None.
 
-  Left deliberately unimplemented as a decoder. UDisks2's SmartTemperature and
-  the wctemp/cctemp attributes disagree on this machine (323 and 356) and
-  neither matches smartctl's 50 C, so there is no single unit assumption that
-  can be validated here. Reporting a confident but wrong temperature is worse
-  than reporting none, so callers get None until the encoding is confirmed.
+  UDisks2 reports SmartTemperature in whole degrees Kelvin for both NVMe and
+  ATA, not tenths of Celsius. Verified on this machine: the NVMe controller
+  reported 320 K while smartctl reported 48 C, and the ATA drive reported
+  313.15 K while smartctl reported 40 C. The wctemp/cctemp NVMe attributes
+  (356/358) are vendor-specific and are deliberately ignored.
   """
-  return None
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return None
+  celsius = round(float(value) - 273.15)
+  return celsius if 0 <= celsius <= 150 else None
+
+
+def nvme_temp_c(nvme_props: dict[str, Any]) -> int | None:
+  """NVMe temperature in Celsius, or None when the drive does not report one."""
+  return kelvin_to_celsius(nvme_props.get("SmartTemperature"))
 
 
 # UDisks2 returns ATA attributes as a(ysqiiqia{sv}) structs:
@@ -350,6 +358,8 @@ ATA_BAD_BLOCKS = ("runtime-bad-block-total", "bad-block-total")
 ATA_TEMPERATURE = ("airflow-temperature-celsius", "temperature-celsius", "current-temperature-celsius")
 ATA_POWER_CYCLES = ("power-cycle-count",)
 ATA_LOAD_CYCLES = ("load-cycle-count",)
+ATA_LBAS_WRITTEN = ("total-lbas-written",)
+ATA_LBAS_READ = ("total-lbas-read",)
 ATA_LIFE = (
   "percent-lifetime-remain",
   "percent-lifetime-remain-indicator",
@@ -357,6 +367,14 @@ ATA_LIFE = (
   "available-spare",
   "percent-used",
 )
+
+# UDisks2 hands back Seagate's 48-bit total-LBA counters (SMART 0xF1/0xF2)
+# pre-multiplied by 2**25 / 10**6. Confirmed empirically against smartctl:
+# a 512 MiB write advanced smartctl's Total_LBAs_Written by exactly 1,048,576
+# while UDisks2's advanced by 35,187,593 (ratio 33.5575), and both the
+# written and read absolute values hold the same 33.554432 ratio to 12
+# significant figures. Undo the scale so the numbers agree with smartctl.
+ATA_LBA_SCALE_UP = 33554432.0 / 1000000.0
 
 
 def norm_attr_name(name: Any) -> str:
@@ -445,6 +463,21 @@ def ata_attr_temp(rows: list[dict[str, Any]], *names: str) -> int | None:
   return raw if 0 <= raw <= 100 else None
 
 
+def ata_lba_bytes(rows: list[dict[str, Any]], *names: str) -> int | None:
+  """Bytes described by a total-LBA counter, or None when unsupported.
+
+  These attributes are vendor-specific (Seagate only) and UDisks2 reports them
+  inflated by ATA_LBA_SCALE_UP, so undo that before converting LBAs to bytes.
+  """
+  raw = ata_attr_raw(rows, *names)
+  if raw is None or raw <= 0:
+    return None
+  lbas = raw / ATA_LBA_SCALE_UP
+  if lbas < 1:
+    return None
+  return int(round(lbas)) * 512
+
+
 def ata_health_percent(rows: list[dict[str, Any]]) -> int | None:
   """Worst normalized value across real wear/failure attributes.
 
@@ -502,7 +535,7 @@ def summarize_nvme(drive: dict[str, Any], nvme_props: dict[str, Any], attrs: dic
     "reportedUncorrect": None,
     "badBlocks": None,
     "udmaCrcErrors": None,
-    "temperatureC": nvme_temp_c(nvme_props, attrs),
+    "temperatureC": nvme_temp_c(nvme_props),
     "powerCycles": as_int(attrs.get("power_cycles")),
     "loadCycles": None,
     "healthPercent": life_remaining,
@@ -528,20 +561,15 @@ def summarize_ata(drive: dict[str, Any], ata_props: dict[str, Any], attrs: Any, 
   bad_blocks = ata_attr_raw(rows, *ATA_BAD_BLOCKS)
   udma_crc = ata_attr_raw(rows, *ATA_UDMA_CRC)
 
-  # UDisks2 exposes drive temperature directly as degrees Celsius, which is
-  # far more reliable than decoding a vendor RAW_VALUE attribute.
-  # UDisks2 hands back SmartTemperature as a float in degrees Kelvin (313.15 K
-  # on this drive, which smartctl confirms as 40 C). Convert to Celsius, then
-  # fall back to the vendor attribute only when the property is missing.
-  temperature = ata_props.get("SmartTemperature")
-  if isinstance(temperature, (int, float)):
-    temperature = int(round(float(temperature) - 273.15))
-  else:
-    temperature = None
-  if temperature is not None and not (0 <= temperature <= 150):
-    temperature = None
+  # Prefer UDisks2's SmartTemperature (whole degrees Kelvin) over the vendor
+  # RAW_VALUE attribute, which is a packed min/max/current encoding on Seagate
+  # drives (raw 313150 for a 40 C disk). Fall back to the attribute only when
+  # the property is missing or unreadable.
+  temperature = kelvin_to_celsius(ata_props.get("SmartTemperature"))
   if temperature is None:
     temperature = ata_attr_temp(rows, *ATA_TEMPERATURE)
+
+  data_written = ata_lba_bytes(rows, *ATA_LBAS_WRITTEN)
 
   life = ata_attr_percent(rows, *ATA_LIFE)
   if life is not None and life <= 100 and ATA_LIFE[0] == "percent-used":
@@ -576,7 +604,7 @@ def summarize_ata(drive: dict[str, Any], ata_props: dict[str, Any], attrs: Any, 
     "percentageUsed": None if life is None else max(0, 100 - life),
     "lifeRemainingPercent": life,
     "healthPercent": health,
-    "tbwTiB": None,
+    "tbwTiB": bytes_to_tib(data_written),
     "criticalWarning": 0,
   }
 

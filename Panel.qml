@@ -118,6 +118,7 @@ Panel {
       return [
         { label: "Health", key: "health" },
         { label: "Power-on", key: "hours" },
+        { label: "Temperature", key: "temp" },
         { label: "Media errors", key: "errors" },
         { label: "Data written", key: "tbw" },
         { label: "Spare", key: "spare" },
@@ -129,6 +130,7 @@ Panel {
       { label: "Health", key: "health" },
       { label: "Power-on", key: "hours" },
       { label: "Temperature", key: "temp" },
+      { label: "Data written", key: "tbw" },
       { label: "Reallocated", key: "errors" },
       { label: "Pending", key: "pending" },
       { label: "Uncorrectable", key: "uncorrectable" },

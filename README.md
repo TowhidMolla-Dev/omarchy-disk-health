@@ -13,11 +13,12 @@ This is a fork of [qadram/omarchy-nvme-health](https://github.com/qadram/omarchy
 Each drive gets its own block in the panel, with the metrics that apply to its type.
 
 **SSDs (NVMe)**
-- Health (remaining life), power-on hours, media/data integrity errors
+- Health (remaining life), power-on hours, temperature, media/data integrity errors
 - Data written (TBW), available spare, wear used, power cycles
 
 **HDDs (SATA/SAS)**
 - Health, power-on hours, temperature
+- Data written, where the drive exposes Seagate's total-LBA counter (SMART 0xF1)
 - Reallocated sectors, pending sectors, offline-uncorrectable sectors
 - Reported uncorrect, bad blocks, UDMA CRC errors, power cycles
 
@@ -63,7 +64,12 @@ Optional settings on the widget entry in `~/.config/omarchy/shell.json`:
 
 Drives are discovered through UDisks2, so anything the desktop stack can see is reported: NVMe, SATA, and USB-attached disks. Optical and removable-media devices are skipped.
 
-A metric shows `—` when the drive does not expose it. That is deliberate: some fields (notably temperature) use vendor-specific encodings, so the plugin prefers reporting nothing over reporting a confidently wrong number.
+A metric shows `—` when the drive does not expose it. That is deliberate: some fields (notably HDD data written, which needs Seagate's SMART 0xF1 counter) use vendor-specific encodings, so the plugin prefers reporting nothing over reporting a confidently wrong number.
+
+Two encodings are corrected so the numbers line up with `smartctl`:
+
+- **Temperature** — UDisks2 reports `SmartTemperature` in whole degrees Kelvin on both NVMe and ATA, not tenths of Celsius. The plugin converts it rather than reading the vendor `RAW_VALUE`, which packs min/max/current on Seagate drives.
+- **HDD data written** — UDisks2 returns Seagate's 48-bit total-LBA counters pre-multiplied by `2^25 / 10^6`. The plugin divides that back out, which puts the result within 0.01% of `smartctl`.
 
 ## Remove
 
