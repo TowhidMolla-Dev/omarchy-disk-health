@@ -22,6 +22,10 @@ Each drive gets its own block in the panel, with the metrics that apply to its t
 - Reallocated sectors, pending sectors, offline-uncorrectable sectors
 - Reported uncorrect, bad blocks, UDMA CRC errors, power cycles
 
+Each drive leads with a **verdict** rather than a bare percentage — "Healthy",
+"12 reallocated sectors", "78 °C is over 70 °C" — followed by the specific
+reasons behind it, so a number is never shown without its explanation.
+
 The bar shows a single value for the **worst** drive: remaining life `%`, or `!` when any drive reports a problem.
 
 ## Install
@@ -59,6 +63,37 @@ Optional settings on the widget entry in `~/.config/omarchy/shell.json`:
 
 - `refreshIntervalSec` — 60–3600 (default `300`)
 - `device` — e.g. `/dev/sda` (empty = monitor every drive)
+- `alertsEnabled` — desktop notifications on threshold crossings (default `true`)
+- `tempWarnC` / `tempCritC` — temperature limits (default `55` / `70`)
+- `healthWarnPct` / `healthCritPct` — remaining-life limits (default `20` / `10`)
+- `spareWarnPct` — NVMe spare limit (default `10`)
+
+## Alerts
+
+When a drive crosses a limit the plugin posts one desktop notification and
+then stays quiet, so a failing disk does not notify on every poll. It speaks up
+again if the drive gets worse, after 6 hours, or if you refresh far enough in
+the future. Critical alerts use the urgent desktop hint.
+
+## Trend history
+
+Each poll is appended to `~/.local/state/disk-health/history.json`, one sample
+per 4 minutes, ~2 days of retention. The panel draws a sparkline per drive and
+adds two derived figures:
+
+- **Write rate** (TiB/month) once there is more than an hour of baseline
+- **Projected life left**, only after a full week of samples
+
+The week-long minimum is deliberate. Two samples taken minutes apart imply
+wildly wrong rates, so the plugin would rather show nothing than a confident
+guess. Wear rates above 400%/month are also rejected as mis-decoded counters.
+
+The file is written atomically, is capped in size, and forgetting it costs
+nothing but the history. Delete it to reset trends:
+
+```sh
+rm ~/.local/state/disk-health/history.json
+```
 
 ## Notes on drive coverage
 

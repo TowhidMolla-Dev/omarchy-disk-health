@@ -41,6 +41,50 @@ Panel {
     return s
   }
 
+  // Alert thresholds live in the panel settings and are passed to status.py,
+  // so there is exactly one source of truth for both the checks and the UI.
+  readonly property int tempWarnC: clampedInt(setting("tempWarnC", 55), 0, 120)
+  readonly property int tempCritC: Math.max(tempWarnC, clampedInt(setting("tempCritC", 70), 0, 120))
+  readonly property int healthWarnPct: clampedInt(setting("healthWarnPct", 20), 0, 100)
+  readonly property int healthCritPct: Math.min(healthWarnPct, clampedInt(setting("healthCritPct", 10), 0, 100))
+  readonly property int spareWarnPct: clampedInt(setting("spareWarnPct", 10), 0, 100)
+  readonly property bool alertsEnabled: setting("alertsEnabled", true) !== false
+
+  function clampedInt(value, min, max) {
+    var n = Number(value)
+    if (!isFinite(n)) return min
+    return Math.max(min, Math.min(max, Math.round(n)))
+  }
+
+  // Worst severity across all drives, for colouring the panel accent.
+  readonly property string worstSeverity: {
+    var order = { critical: 0, warn: 1, ok: 2, unknown: 3 }
+    var worst = "unknown"
+    for (var i = 0; i < disks.length; i++) {
+      var s = Model.severity(disks[i])
+      if (order[s] < order[worst]) worst = s
+    }
+    return worst
+  }
+
+  readonly property color severityColor: {
+    if (worstSeverity === "critical") return bar ? bar.urgent : Color.urgent
+    if (worstSeverity === "warn") return Color.warning
+    return contentForeground
+  }
+
+  function statusArgv() {
+    var argv = ["python3", root.pluginDir + "/status.py"]
+    if (configuredDevice !== "") argv.push(configuredDevice)
+    if (!alertsEnabled) argv.push("--noalerts")
+    argv.push("--tempWarnC=" + tempWarnC)
+    argv.push("--tempCritC=" + tempCritC)
+    argv.push("--healthWarnPct=" + healthWarnPct)
+    argv.push("--healthCritPct=" + healthCritPct)
+    argv.push("--spareWarnPct=" + spareWarnPct)
+    return argv
+  }
+
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property color contentDim: Qt.darker(contentForeground, 1.5)
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
@@ -177,9 +221,7 @@ Panel {
 
   Process {
     id: proc
-    command: root.configuredDevice !== ""
-      ? ["python3", root.pluginDir + "/status.py", root.configuredDevice]
-      : ["python3", root.pluginDir + "/status.py"]
+    command: root.statusArgv()
     stdout: StdioCollector {
       id: statusStdout
       waitForEnd: true
@@ -307,15 +349,38 @@ Panel {
                 if (driveRow.drive.passed === false) return "SMART FAILED"
                 return "SMART status unknown"
               }
+              // Lead with the verdict, not the raw percentage, so the panel
+              // says why a drive is unhealthy instead of just how much.
               text: (driveRow.drive && driveRow.drive.device ? String(driveRow.drive.device) : "")
-                + "  ·  " + smartStatusLine.verdict
-                + (driveRow.drive && driveRow.drive.warning === true ? "  ·  needs attention" : "")
-              color: driveRow.drive && (driveRow.drive.passed === false || driveRow.drive.warning === true)
-                ? (root.bar ? root.bar.urgent : Color.urgent)
-                : root.contentDim
+                + "  ·  " + (Model.verdictHeadline(driveRow.drive) || smartStatusLine.verdict)
+              color: {
+                var s = Model.severity(driveRow.drive)
+                if (s === "critical" || (driveRow.drive && driveRow.drive.passed === false))
+                  return (root.bar ? root.bar.urgent : Color.urgent)
+                if (s === "warn") return Color.warning
+                return root.contentDim
+              }
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption
+              font.bold: Model.severity(driveRow.drive) !== "ok"
               wrapMode: Text.WordWrap
+            }
+
+            // Additional reasons beyond the headline.
+            Repeater {
+              model: Model.verdictReasons(driveRow.drive)
+
+              Text {
+                required property var modelData
+                width: driveRow.width
+                text: "· " + String(modelData)
+                color: Model.severity(driveRow.drive) === "critical"
+                  ? (root.bar ? root.bar.urgent : Color.urgent)
+                  : Color.warning
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
             }
 
             Repeater {
@@ -340,6 +405,127 @@ Panel {
                   font.family: root.contentFontFamily
                   font.pixelSize: Style.font.body
                   font.bold: true
+                }
+              }
+            }
+
+            // Trend row: sparklines plus the derived rates. Hidden entirely
+            // until enough samples exist to be meaningful.
+            Row {
+              id: trendRow
+              width: driveRow.width
+              spacing: Style.space(12)
+              visible: Model.trend(driveRow.drive, "used").length >= 2
+                || Model.trend(driveRow.drive, "written").length >= 2
+                || Model.trend(driveRow.drive, "tempC").length >= 2
+
+              Text {
+                width: Style.space(140)
+                text: "Trend"
+                color: root.contentDim
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Column {
+                width: Math.max(0, trendRow.width - Style.space(140) - Style.space(12))
+                spacing: Style.space(4)
+
+                Repeater {
+                  model: [
+                    { label: "Temperature", key: "tempC", unit: " °C" },
+                    { label: "Life used", key: "used", unit: "%" },
+                    { label: "Data written", key: "written", unit: " TiB" }
+                  ]
+
+                  Row {
+                    required property var modelData
+                    width: parent.width
+                    spacing: Style.space(8)
+                    visible: Model.trend(driveRow.drive, modelData.key).length >= 2
+
+                    Text {
+                      width: Style.space(80)
+                      text: modelData.label
+                      color: root.contentDim
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Canvas {
+                      id: spark
+                      // Bound directly; onSeriesChanged repaints whenever the
+                      // underlying trend data is replaced.
+                      property var series: Model.trend(driveRow.drive, modelData.key)
+                      property color strokeColor: root.contentForeground
+                      width: Style.space(90)
+                      height: Style.space(14)
+                      renderStrategy: Canvas.Immediate
+                      onSeriesChanged: requestPaint()
+                      onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        var pts = Model.sparkPoints(series, width, height, 1)
+                        if (pts.length < 4) return
+                        ctx.strokeStyle = strokeColor
+                        ctx.lineWidth = 1.5
+                        ctx.lineJoin = "round"
+                        ctx.beginPath()
+                        ctx.moveTo(pts[0], pts[1])
+                        for (var i = 2; i < pts.length; i += 2)
+                          ctx.lineTo(pts[i], pts[i + 1])
+                        ctx.stroke()
+                      }
+                    }
+
+                    Text {
+                      property var last: spark.series.length
+                        ? spark.series[spark.series.length - 1]
+                        : null
+                      text: last === null
+                        ? "—"
+                        : (Math.abs(last) < 10 ? last.toFixed(1) : Math.round(last)) + modelData.unit
+                      color: root.contentForeground
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+
+                // Derived rates: only shown when the baseline is long enough
+                // for the estimate to mean anything (see status.py).
+                Row {
+                  width: parent.width
+                  spacing: Style.space(8)
+                  visible: driveRow.drive && driveRow.drive.trend
+                    && (driveRow.drive.trend.monthsLeft !== undefined
+                        || driveRow.drive.trend.writeTiBPerMonth !== undefined)
+
+                  Text {
+                    width: Style.space(80)
+                    text: "Projection"
+                    color: root.contentDim
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    width: parent.width - Style.space(88)
+                    text: {
+                      if (!driveRow.drive || !driveRow.drive.trend) return ""
+                      var t = driveRow.drive.trend
+                      var parts = []
+                      if (t.monthsLeft !== undefined)
+                        parts.push("~" + Model.formatMonths(t.monthsLeft) + " of life left")
+                      if (t.writeTiBPerMonth !== undefined)
+                        parts.push(Model.formatRate(t.writeTiBPerMonth) + " written")
+                      return parts.join("  ·  ")
+                    }
+                    color: root.contentDim
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
                 }
               }
             }

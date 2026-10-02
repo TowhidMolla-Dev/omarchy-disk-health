@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.TowhidMolla-Dev.disk-health",
   "name": "Disk Health",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "TowhidMolla-Dev",
   "license": "MIT",
-  "description": "SSD and HDD SMART health in the Omarchy bar via UDisks2: power-on hours, reallocated and pending sectors, CRC errors, TBW, and remaining life.",
+  "description": "SSD and HDD SMART health in the Omarchy bar via UDisks2: remaining life, reallocated and pending sectors, CRC errors, data written, temperature, trend history, and threshold alerts.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
@@ -18,7 +18,13 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 300,
-      "device": ""
+      "device": "",
+      "alertsEnabled": true,
+      "tempWarnC": 55,
+      "tempCritC": 70,
+      "healthWarnPct": 20,
+      "healthCritPct": 10,
+      "spareWarnPct": 10
     },
     "schema": [
       {
@@ -37,6 +43,60 @@
         "defaultValue": "",
         "maxLength": 64,
         "description": "Empty monitors every SSD and HDD reported by UDisks2."
+      },
+      {
+        "key": "alertsEnabled",
+        "type": "boolean",
+        "label": "Send alerts",
+        "defaultValue": true,
+        "description": "Notify once when a drive crosses a threshold, then stay quiet until it worsens or the alert expires."
+      },
+      {
+        "key": "tempWarnC",
+        "type": "integer",
+        "label": "Temperature warning (°C)",
+        "min": 0,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 55
+      },
+      {
+        "key": "tempCritC",
+        "type": "integer",
+        "label": "Temperature critical (°C)",
+        "min": 0,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 70,
+        "description": "Critical is raised to the warning value if it is set lower."
+      },
+      {
+        "key": "healthWarnPct",
+        "type": "integer",
+        "label": "Remaining life warning (%)",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 20
+      },
+      {
+        "key": "healthCritPct",
+        "type": "integer",
+        "label": "Remaining life critical (%)",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "Critical is lowered to the warning value if it is set higher."
+      },
+      {
+        "key": "spareWarnPct",
+        "type": "integer",
+        "label": "NVMe spare warning (%)",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 10
       }
     ]
   }

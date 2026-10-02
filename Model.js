@@ -107,6 +107,94 @@ function isSsd(disk) {
   return disk.protocol === "nvme"
 }
 
+// Severity for a drive: "critical" > "warn" > "ok". Returns "unknown" when
+// the payload has no verdict (older status.py or an unreadable drive).
+function severity(disk) {
+  if (!disk || typeof disk !== "object") return "unknown"
+  var v = disk.verdict
+  if (!v || typeof v !== "object") return "unknown"
+  var s = String(v.severity || "")
+  return s === "critical" || s === "warn" || s === "ok" ? s : "unknown"
+}
+
+function verdictHeadline(disk) {
+  if (!disk || typeof disk.verdict !== "object") return ""
+  return String(disk.verdict.headline || "")
+}
+
+// Reasons beyond the headline, so the panel does not print it twice.
+function verdictReasons(disk) {
+  if (!disk || typeof disk.verdict !== "object") return []
+  var all = disk.verdict.reasons
+  if (!Array.isArray(all)) return []
+  var out = []
+  for (var i = 0; i < all.length; i++) {
+    var text = String(all[i] || "")
+    if (!text) continue
+    if (i === 0 && text === verdictHeadline(disk)) continue
+    out.push(text)
+  }
+  return out
+}
+
+function trend(disk, name) {
+  if (!disk || typeof disk.trend !== "object") return []
+  var pts = disk.trend[name]
+  if (!Array.isArray(pts) || pts.length < 2) return []
+  var out = []
+  for (var i = 0; i < pts.length; i++) {
+    var p = pts[i]
+    if (!Array.isArray(p) || p.length !== 2) continue
+    var value = Number(p[1])
+    if (!isFinite(value)) continue
+    out.push(value)
+  }
+  return out.length >= 2 ? out : []
+}
+
+// Map values to 0..1 for drawing. When every sample is identical (a flat
+// line) return a centred 0.5 so the sparkline draws mid-height instead of
+// collapsing onto an edge.
+function sparkPoints(values, width, height, padding) {
+  var pts = []
+  if (!Array.isArray(values) || values.length < 2) return pts
+  var pad = padding === undefined ? 1 : padding
+  var min = Math.min.apply(null, values)
+  var max = Math.max.apply(null, values)
+  var span = max - min
+  var innerW = Math.max(1, width - pad * 2)
+  var innerH = Math.max(1, height - pad * 2)
+  var last = values.length - 1
+  for (var i = 0; i < values.length; i++) {
+    var fx = pad + (i / last) * innerW
+    var fy
+    if (span <= 0) {
+      fy = pad + innerH / 2
+    } else {
+      fy = pad + innerH * (1 - (values[i] - min) / span)
+    }
+    pts.push(fx, fy)
+  }
+  return pts
+}
+
+function formatMonths(value) {
+  if (value === null || value === undefined || !isFinite(Number(value))) return "—"
+  var months = Number(value)
+  if (months < 1) return "< 1 month"
+  if (months < 24) return Math.round(months) + " months"
+  var years = months / 12
+  return (years < 10 ? years.toFixed(1) : Math.round(years)) + " years"
+}
+
+function formatRate(value) {
+  if (value === null || value === undefined || !isFinite(Number(value))) return "—"
+  var n = Number(value)
+  if (n < 1) return n.toFixed(2) + " TiB/mo"
+  if (n < 10) return n.toFixed(1) + " TiB/mo"
+  return Math.round(n) + " TiB/mo"
+}
+
 function parseStatus(text) {
   try {
     var data = JSON.parse(clampStatusText(text))
@@ -127,6 +215,13 @@ if (typeof module !== "undefined") {
     formatTemp: formatTemp,
     formatCount: formatCount,
     isSsd: isSsd,
+    severity: severity,
+    verdictHeadline: verdictHeadline,
+    verdictReasons: verdictReasons,
+    trend: trend,
+    sparkPoints: sparkPoints,
+    formatMonths: formatMonths,
+    formatRate: formatRate,
     healthyPercent: healthyPercent,
     worstDisk: worstDisk,
     diskList: diskList,

@@ -8,7 +8,10 @@ smartctl, no sudoers. Requires udisks2 (ships with Omarchy).
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -59,6 +62,46 @@ NVME_ATTR_KEYS = (
 # Attribute 9 raw on some HDDs is a packed/minutes counter that decodes to an
 # absurd number of hours. Anything above this is a vendor encoding, not hours.
 MAX_PLAUSIBLE_HOURS = 500_000
+
+# --- Verdict / alert / history tuning ---------------------------------------
+# Alerts fire on threshold *crossing* only, so a sick disk does not notify on
+# every poll. Each alert is remembered for NOTIFY_REPEAT_SEC.
+NOTIFY_REPEAT_SEC = 6 * 3600
+MIN_NOTIFY_GAP_SEC = 900
+MAX_REASON_LEN = 120
+
+# History is a bounded ring of [epoch, value] pairs per series per device.
+HISTORY_MAX_POINTS = 720  # ~2 days at the 300 s default cadence
+HISTORY_MAX_SERIES = 4
+HISTORY_MAX_DEVICES = 16
+# Sample no more often than this; a fast refresh must not fill the ring in
+# minutes and starve the longer baseline.
+HISTORY_MIN_INTERVAL_SEC = 240
+# Points handed to the UI. A sparkline does not get more legible past ~60,
+# and the payload must stay well inside MAX_JSON_BYTES.
+TREND_POINTS_MAX = 60
+# Drives that carry trend data, worst-first. Bounds the payload on machines
+# with many disks; the rest keep their counters but no sparkline.
+TREND_MAX_DISKS = 6
+# Require a real baseline before quoting a wear projection, otherwise the
+# first two samples (minutes apart) imply absurd rates.
+PROJECTION_MIN_SPAN_SEC = 7 * 24 * 3600
+# Cap derived monthly rates. A real SSD burns 1-3%/month even under heavy
+# abuse, so 400 is generous; anything faster is a mis-decoded counter or a
+# counter that reset mid-window, and would print a nonsense life estimate.
+MAX_PROJECTED_PER_MONTH = 400.0
+
+# Default alert thresholds. Overridable from the panel settings, which pass
+# them in as --key=value so there is a single source of truth.
+DEFAULT_THRESHOLDS = {
+  "tempWarnC": 55,
+  "tempCritC": 70,
+  "healthWarnPct": 20,
+  "healthCritPct": 10,
+  "reallocWarn": 0,
+  "badBlocksWarn": 0,
+  "spareWarnPct": 10,
+}
 
 T = TypeVar("T")
 
@@ -117,6 +160,44 @@ def bytes_to_tib(num_bytes: int | None) -> float | None:
   if num_bytes is None or num_bytes < 0:
     return None
   return round(num_bytes / (1024**4), 2)
+
+
+def state_dir() -> str:
+  """Per-user state directory; falls back to a temp dir when HOME is unset."""
+  base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+    os.path.expanduser("~"), ".local", "state"
+  )
+  if not base or base.startswith("~"):
+    base = os.path.join(tempfile.gettempdir(), "disk-health-" + str(os.getuid()))
+  return os.path.join(base, "disk-health")
+
+
+def parse_thresholds(argv: list[str]) -> dict[str, Any]:
+  """Read --key=value overrides, clamped so a typo cannot break the shell."""
+  out = dict(DEFAULT_THRESHOLDS)
+  for arg in argv:
+    if not arg.startswith("--") or "=" not in arg:
+      continue
+    key, _, raw = arg[2:].partition("=")
+    if key not in out:
+      continue
+    try:
+      value = float(raw)
+    except ValueError:
+      continue
+    if key in ("tempWarnC", "tempCritC"):
+      value = max(0.0, min(120.0, value))
+    elif key in ("healthWarnPct", "healthCritPct", "spareWarnPct"):
+      value = max(0.0, min(100.0, value))
+    else:
+      value = max(0.0, min(1_000_000.0, value))
+    out[key] = int(value)
+  # A warn floor above its critical ceiling would make the drive look fine.
+  if out["tempCritC"] < out["tempWarnC"]:
+    out["tempCritC"] = out["tempWarnC"]
+  if out["healthCritPct"] > out["healthWarnPct"]:
+    out["healthCritPct"] = out["healthWarnPct"]
+  return out
 
 
 def run_timed(timeout_sec: float, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -696,6 +777,319 @@ def fetch_smart(disk: dict[str, Any]) -> dict[str, Any]:
   return summarize_ata(drive, ctrl, attrs, device)
 
 
+def _reason(text: str) -> str:
+  return clamp_str(text, MAX_REASON_LEN)
+
+
+def judge(disk: dict[str, Any], th: dict[str, Any]) -> dict[str, Any]:
+  """Plain-English verdict plus the specific reasons behind it.
+
+  Severity is ordered worst-first so the panel can pick one headline. The
+  reasons exist so a bare percentage is never shown on its own.
+  """
+  critical: list[str] = []
+  warn: list[str] = []
+
+  if disk.get("passed") is False:
+    critical.append(_reason("SMART reports failure"))
+  if disk.get("warning") and not critical:
+    warn.append(_reason("drive reports a problem"))
+
+  health = disk.get("lifeRemainingPercent")
+  if health is None:
+    health = disk.get("healthPercent")
+  if isinstance(health, int):
+    if health <= th["healthCritPct"]:
+      critical.append(_reason(f"health at {health}%"))
+    elif health <= th["healthWarnPct"]:
+      warn.append(_reason(f"health at {health}%"))
+
+  temp = disk.get("temperatureC")
+  if isinstance(temp, int):
+    if temp >= th["tempCritC"]:
+      critical.append(_reason(f"{temp} °C is over {th['tempCritC']} °C"))
+    elif temp >= th["tempWarnC"]:
+      warn.append(_reason(f"{temp} °C is over {th['tempWarnC']} °C"))
+
+  # Error counters: any growth at all is worth flagging on an HDD.
+  floor = th["reallocWarn"]
+  for key, label, limit in (
+    ("reallocatedSectors", "reallocated sector", floor),
+    ("pendingSectors", "pending sector", floor),
+    ("offlineUncorrectable", "uncorrectable sector", floor),
+    ("reportedUncorrect", "reported uncorrect", floor),
+    ("badBlocks", "bad block", th["badBlocksWarn"]),
+    ("mediaErrors", "media error", 0),
+  ):
+    count = disk.get(key)
+    if isinstance(count, int) and count > limit:
+      warn.append(_reason(f"{count:,} {label}{'s' if count != 1 else ''}"))
+
+  spare = disk.get("availableSparePercent")
+  if isinstance(spare, int) and spare < th["spareWarnPct"]:
+    warn.append(_reason(f"spare at {spare}%"))
+
+  used = disk.get("percentageUsed")
+  if isinstance(used, int) and used >= 100:
+    critical.append(_reason(f"{used}% of write endurance used"))
+
+  if critical:
+    severity, reasons = "critical", critical + warn
+  elif warn:
+    severity, reasons = "warn", warn
+  else:
+    severity, reasons = "ok", []
+
+  if severity == "ok":
+    # Distinguish "checked and fine" from "nothing was readable", so an
+    # unsupported metric never reads as a clean bill of health.
+    readable = isinstance(health, int) or isinstance(temp, int) or disk.get("passed") is not None
+    if not readable:
+      headline = "Not enough data"
+    elif isinstance(health, int) and health >= 90:
+      headline = "Healthy"
+    else:
+      headline = "No problems detected"
+  else:
+    headline = reasons[0]
+
+  return {
+    "severity": severity,
+    "headline": clamp_str(headline, MAX_REASON_LEN),
+    "reasons": reasons[:6],
+  }
+
+
+# --- History ----------------------------------------------------------------
+
+def load_history() -> dict[str, Any]:
+  """Load the history store, ignoring anything malformed rather than failing."""
+  path = os.path.join(state_dir(), "history.json")
+  try:
+    with open(path, "r", encoding="utf-8") as handle:
+      data = json.load(handle)
+  except (OSError, ValueError):
+    return {}
+  return data if isinstance(data, dict) else {}
+
+
+def write_history(data: dict[str, Any]) -> None:
+  """Atomically persist history so a killed run cannot truncate it."""
+  directory = state_dir()
+  try:
+    os.makedirs(directory, exist_ok=True)
+    tmp = os.path.join(directory, ".history.json.%d.tmp" % os.getpid())
+    with open(tmp, "w", encoding="utf-8") as handle:
+      json.dump(data, handle, separators=(",", ":"))
+    os.replace(tmp, os.path.join(directory, "history.json"))
+  except OSError:
+    pass  # A read-only or full home dir must not break the widget.
+
+
+def record_history(
+  store: dict[str, Any], disks: list[dict[str, Any]], raised: list[dict[str, Any]]
+) -> None:
+  """Append this poll to the per-device series and prune to the ring size."""
+  now = int(time.time())
+  series = store.setdefault("disks", {})
+  if not isinstance(series, dict):
+    store["disks"] = series = {}
+  if not isinstance(store.get("notified"), dict):
+    store["notified"] = {}
+
+  fresh: list[str] = []
+  for disk in disks:
+    device = disk.get("device") or ""
+    if not device:
+      continue
+    entry = series.get(device)
+    if not isinstance(entry, dict):
+      entry = series[device] = {"series": {}}
+    bucket = entry.get("series")
+    if not isinstance(bucket, dict):
+      bucket = entry["series"] = {}
+
+    stamp = entry.get("last")
+    if isinstance(stamp, int) and now - stamp < HISTORY_MIN_INTERVAL_SEC:
+      fresh.append(device)
+      continue  # Too soon; do not spend a ring slot.
+    entry["last"] = now
+
+    for name, key in (
+      ("tempC", "temperatureC"),
+      ("health", "lifeRemainingPercent"),
+      ("used", "percentageUsed"),
+      ("written", "tbwTiB"),
+    ):
+      value = disk.get(key)
+      if isinstance(value, (int, float)):
+        points = bucket.get(name)
+        if not isinstance(points, list):
+          points = bucket[name] = []
+        points.append([now, round(float(value), 2)])
+        if len(points) > HISTORY_MAX_POINTS:
+          del points[: len(points) - HISTORY_MAX_POINTS]
+
+  # Forget drives that have been unplugged for a long time, so the file cannot
+  # grow without bound.
+  for device in list(series):
+    if len(series) > HISTORY_MAX_DEVICES and device not in fresh:
+      last = series[device].get("last") if isinstance(series[device], dict) else None
+      if isinstance(last, int) and now - last > 30 * 24 * 3600:
+        del series[device]
+
+  # `raised` is already stamped into store["notified"] by fire_alerts(); it is
+  # kept in the signature so callers cannot forget to record alerts at all.
+  del raised
+
+
+def downsample(points: list[list[float]], limit: int = TREND_POINTS_MAX) -> list[list[float]]:
+  """Reduce a series to at most `limit` points for display.
+
+  Keeps the first and last sample and strides through the rest. Rates are
+  always computed from the full-resolution series, never from this.
+  """
+  n = len(points)
+  if n <= limit:
+    return [[int(p[0]), round(float(p[1]), 2)] for p in points]
+  step = (n - 1) / (limit - 1)
+  out: list[list[float]] = []
+  seen: set[int] = set()
+  for i in range(limit):
+    idx = int(round(i * step))
+    if idx >= n:
+      idx = n - 1
+    if idx in seen:
+      continue
+    seen.add(idx)
+    out.append([int(points[idx][0]), round(float(points[idx][1]), 2)])
+  return out
+
+
+def trend_for(disk: dict[str, Any]) -> dict[str, Any]:
+  """Derive sparkline points and a wear projection from recorded history.
+
+  The projection needs a week of baseline; without one, per-month rates are
+  dominated by counter jitter and would be worse than showing nothing.
+  """
+  store = load_history()
+  entry = (store.get("disks") or {}).get(disk.get("device") or "")
+  if not isinstance(entry, dict):
+    return {}
+  bucket = entry.get("series")
+  if not isinstance(bucket, dict):
+    return {}
+
+  def points(name: str) -> list[list[float]]:
+    raw = bucket.get(name)
+    if not isinstance(raw, list):
+      return []
+    return [p for p in raw if isinstance(p, list) and len(p) == 2 and isinstance(p[1], (int, float))]
+
+  out: dict[str, Any] = {}
+  for name in ("tempC", "health", "used", "written"):
+    pts = points(name)
+    if len(pts) >= 2:
+      out[name] = downsample(pts)
+
+  temp = points("tempC")
+  if len(temp) >= 2:
+    out["tempRange"] = [min(p[1] for p in temp), max(p[1] for p in temp)]
+
+  used = points("used")
+  if len(used) >= 2:
+    span = used[-1][0] - used[0][0]
+    delta = used[-1][1] - used[0][1]
+    if span >= PROJECTION_MIN_SPAN_SEC and delta > 0:
+      per_month = delta / span * 30 * 24 * 3600
+      if 0 < per_month <= MAX_PROJECTED_PER_MONTH:
+        remaining = 100 - used[-1][1]
+        if remaining > 0:
+          out["monthsLeft"] = round(remaining / per_month, 1)
+        out["wearPerMonth"] = round(per_month, 2)
+
+  written = points("written")
+  if len(written) >= 2:
+    span = written[-1][0] - written[0][0]
+    delta = written[-1][1] - written[0][1]
+    if span >= 3600 and delta > 0:
+      out["writeTiBPerMonth"] = round(delta / span * 30 * 24 * 3600, 2)
+
+  return out
+
+
+# --- Notifications ----------------------------------------------------------
+
+def notify(title: str, body: str, urgent: bool) -> None:
+  """Fire a desktop notification without blocking the poll."""
+  argv = ["notify-send", "-a", "Disk Health"]
+  if urgent:
+    argv += ["-u", "critical"]
+  argv += ["-i", "drive-harddisk-symbolic", title, body]
+  try:
+    subprocess.Popen(
+      argv,
+      stdin=subprocess.DEVNULL,
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+      start_new_session=True,
+    )
+  except OSError:
+    pass  # No notification daemon is not a reason to fail the poll.
+
+
+def fire_alerts(
+  disks: list[dict[str, Any]],
+  th: dict[str, Any],
+  enabled: bool,
+  store: dict[str, Any],
+) -> list[dict[str, Any]]:
+  """Notify on threshold crossing, with per-alert repeat suppression.
+
+  Stamps `store` in place; the caller persists it once together with the new
+  history samples so alert state and samples can never drift apart.
+  """
+  notified = store.get("notified")
+  if not isinstance(notified, dict):
+    notified = {}
+    store["notified"] = notified
+  now = int(time.time())
+  raised: list[dict[str, Any]] = []
+
+  for disk in disks:
+    verdict = disk.get("verdict") or {}
+    severity = verdict.get("severity") if isinstance(verdict, dict) else None
+    if severity == "ok":
+      continue
+    reasons = verdict.get("reasons") if isinstance(verdict, dict) else []
+    if not isinstance(reasons, list) or not reasons:
+      continue
+    device = disk.get("device") or "drive"
+    # Key on device+severity so a drive worsening from warn to critical
+    # notifies immediately instead of waiting out the repeat window.
+    key = "%s|%s" % (device, severity)
+    last = notified.get(key)
+    if isinstance(last, int):
+      if now - last < MIN_NOTIFY_GAP_SEC:
+        continue
+      if now - last < NOTIFY_REPEAT_SEC and severity == "warn":
+        continue
+
+    headline = verdict.get("headline") or reasons[0]
+    detail = "; ".join(str(r) for r in reasons[:4])
+    model = disk.get("model") or device
+    title = "Disk %s: %s" % (model, headline)
+    body = "%s — %s" % (device, detail)
+    if enabled:
+      notify(title, body, severity == "critical")
+    raised.append({"key": key, "severity": severity})
+    # Stamp regardless of whether it was actually sent, so a disabled alert
+    # cannot bank a notification to fire later when re-enabled.
+    notified[key] = now
+
+  return raised
+
+
 def disk_rank(disk: dict[str, Any]) -> tuple[int, int, int, int]:
   """Sort key: most urgent drive first."""
   life = disk.get("lifeRemainingPercent")
@@ -708,7 +1102,9 @@ def disk_rank(disk: dict[str, Any]) -> tuple[int, int, int, int]:
   )
 
 
-def fetch_all(drives: list[dict[str, Any]], requested: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def fetch_all(
+  drives: list[dict[str, Any]], requested: str, th: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
   """Query SMART for every enumerated drive (or just the requested one).
 
   Returns (summaries, failed) where summaries is sorted worst-first.
@@ -727,13 +1123,17 @@ def fetch_all(drives: list[dict[str, Any]], requested: str) -> tuple[list[dict[s
       failed.append(result)
     else:
       summaries.append(result)
+  for disk in summaries:
+    disk["verdict"] = judge(disk, th)
   summaries.sort(key=disk_rank)
   return summaries, failed
 
 
 def main() -> int:
   raw_arg = sys.argv[1] if len(sys.argv) > 1 else ""
-  requested = clamp_str(raw_arg, MAX_DEVICE_ARG_LEN)
+  requested = "" if raw_arg.startswith("--") else clamp_str(raw_arg, MAX_DEVICE_ARG_LEN)
+  thresholds = parse_thresholds(sys.argv[1:])
+  alerts_enabled = "noalerts" not in sys.argv[1:]
   deadline = time.monotonic() + PROCESS_DEADLINE_SEC
 
   try:
@@ -796,7 +1196,7 @@ def main() -> int:
     )
     return 0
 
-  summaries, failed = fetch_all(disks, requested)
+  summaries, failed = fetch_all(disks, requested, thresholds)
   if not summaries:
     first_error = failed[0].get("error") if failed else ""
     emit(
@@ -811,6 +1211,22 @@ def main() -> int:
       }
     )
     return 0
+
+  for index, disk in enumerate(summaries):
+    # summaries are worst-first, so the drives that matter most keep trends.
+    disk["trend"] = trend_for(disk) if index < TREND_MAX_DISKS else {}
+
+  # One load/modify/write for both alert state and history samples.
+  store = load_history()
+  try:
+    raised = fire_alerts(summaries, thresholds, alerts_enabled, store)
+  except Exception:
+    raised = []
+  try:
+    record_history(store, summaries, raised)
+    write_history(store)
+  except Exception:
+    pass  # History is a nice-to-have; never let it break the widget.
 
   emit(
     {
